@@ -113,6 +113,16 @@ const btcToSats = (v) => {
   return v != null && Number.isFinite(n) ? String(Math.round(n * 1e8)) : null
 }
 
+// The addresses we track (same five on both providers). Blockdaemon's whole-transaction events
+// list every address in the tx, so we need this list to keep only ours.
+const TRACKED = new Set([
+  'bc1quhruqrghgcca950rvhtrg7cpd7u8k6svpzgzmrjy8xyukacl5lkq0r8l2d', // OKX
+  'bc1qtm7ye0wm085hhv88japwkalmwkt3amec5z9c7a3unv05tfg6y2pstr3xfz', // Foundry
+  '37jKPSmbEGwgfacCr2nayn1wTaqMAbA94Z', // AntPool
+  '1K6KoYC69NnafWJ7YgtrpwJxBLiijWqwa6', // F2Pool
+  '1Ay8vMC7R1UbyCCZRVULMV7iQpHSAbguJP', // Upbit
+])
+
 const sourceIp = (c) =>
   (c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || '').split(',')[0].trim() || null
 
@@ -190,24 +200,37 @@ function extractBlockdaemon(body) {
     ]
   }
 
-  if (body.event_type === 'unified_confirmed_tx' && d.tx_id) {
-    const addrs = new Set()
+  // Whole-transaction event. For Bitcoin, `transfers` lists every input (event_name "vin") and
+  // output ("vout"); the address is in `from` (also for outputs) and `value` is in satoshis.
+  // We keep only the addresses we track, as one row per input/output, the same shape as above.
+  // unified_pending_tx is the same event sent earlier, while the transaction is still in the
+  // mempool (no block yet). We store it with status 'pending'; the comparison ignores it and a
+  // separate "pending" section of /compare reports on it.
+  if ((body.event_type === 'unified_confirmed_tx' || body.event_type === 'unified_pending_tx') && d.tx_id) {
+    const pending = body.event_type === 'unified_pending_tx'
+    const out = []
+    let vin = 0
+    let vout = 0
     for (const t of d.transfers ?? []) {
-      for (const k of ['from', 'to']) if (typeof t?.[k] === 'string') addrs.add(t[k])
-    }
-    return [
-      {
+      const isIn = t?.event_name === 'vin'
+      const isOut = t?.event_name === 'vout'
+      if (!isIn && !isOut) continue
+      const n = isIn ? vin++ : vout++
+      const a = typeof t.from === 'string' ? t.from : null
+      if (!a || !TRACKED.has(a)) continue
+      out.push({
         ...base,
         tx_id: d.tx_id,
-        status: d.status ?? null,
-        block_time: toDate(d.timestamp),
-        address: null,
-        addresses: [...addrs],
-        leg: null,
-        value_sats: null,
-        n: null,
-      },
-    ]
+        status: pending ? 'pending' : 'confirmed',
+        block_time: pending ? null : toDate(d.timestamp),
+        address: a,
+        addresses: [a],
+        leg: isIn ? 'input' : 'output',
+        value_sats: /^\d+$/.test(String(t.value)) ? String(t.value) : null,
+        n,
+      })
+    }
+    return out
   }
 
   return []
@@ -242,10 +265,15 @@ async function insertTx(eventId, provider, receivedAt, r) {
 // Earlier deliveries that arrived before we understood Blockdaemon's input/output events were
 // stored raw but never extracted. Extract them now (runs on every start, does nothing once done).
 async function backfillBlockdaemon() {
+  // Older versions saved whole-transaction events as one row with no address; redo those properly.
+  await pool.query(
+    `DELETE FROM tx_events WHERE provider = 'blockdaemon' AND leg IS NULL AND address IS NULL`,
+  )
   const { rows } = await pool.query(
     `SELECT e.id, e.received_at, e.body FROM events e
       WHERE e.provider = 'blockdaemon' AND e.body IS NOT NULL
-        AND e.event_type IN ('unified_confirmed_input', 'unified_confirmed_output')
+        AND e.event_type IN ('unified_confirmed_input', 'unified_confirmed_output',
+                             'unified_confirmed_tx', 'unified_pending_tx')
         AND NOT EXISTS (SELECT 1 FROM tx_events t WHERE t.event_id = e.id)
       ORDER BY e.id`,
   )
@@ -426,7 +454,7 @@ app.get('/compare', async (c) => {
     bd AS (
       SELECT DISTINCT ON (tx_id, address, leg, n) tx_id, address, leg, n, value_sats, received_at
         FROM tx_events
-       WHERE provider = 'blockdaemon' AND address IS NOT NULL
+       WHERE provider = 'blockdaemon' AND address IS NOT NULL AND coalesce(status, '') <> 'pending'
        ORDER BY tx_id, address, leg, n, received_at),
     b AS (
       SELECT tx_id, address, min(received_at) AS t,
@@ -441,7 +469,32 @@ app.get('/compare', async (c) => {
          AND ($2::timestamptz IS NULL OR least(a.t, b.t) >= $2))`
   const q = (sql) => pool.query(joined + sql, [grace, since]).then((r) => r.rows)
 
-  const [summary, mismatches, deliveries, gaps] = await Promise.all([
+  // Blockdaemon pending (mempool) notifications. Alchemy has no equivalent, so this is a report on
+  // Blockdaemon alone: how often a pending alert came before the confirmed one, and by how long.
+  const pendingSql = `
+    WITH p AS (
+      SELECT tx_id, address, min(received_at) AS t FROM tx_events
+       WHERE provider = 'blockdaemon' AND status = 'pending' AND address IS NOT NULL GROUP BY 1, 2),
+    cf AS (
+      SELECT tx_id, address, min(received_at) AS t FROM tx_events
+       WHERE provider = 'blockdaemon' AND status = 'confirmed' AND address IS NOT NULL GROUP BY 1, 2),
+    pj AS (
+      SELECT coalesce(p.tx_id, cf.tx_id) AS tx_id, coalesce(p.address, cf.address) AS address,
+             p.t AS pending_at, cf.t AS confirmed_at
+        FROM p FULL JOIN cf ON p.tx_id = cf.tx_id AND p.address = cf.address
+       WHERE least(p.t, cf.t) < now() - make_interval(mins => $1::int)
+         AND ($2::timestamptz IS NULL OR least(p.t, cf.t) >= $2))
+    SELECT count(*) FILTER (WHERE pending_at IS NOT NULL)::int AS pending_pairs,
+           count(*) FILTER (WHERE pending_at IS NOT NULL AND confirmed_at IS NOT NULL)::int AS pending_then_confirmed,
+           count(*) FILTER (WHERE pending_at IS NOT NULL AND confirmed_at IS NULL
+                              AND pending_at < now() - interval '60 minutes')::int AS pending_not_confirmed_after_60min,
+           count(*) FILTER (WHERE pending_at IS NULL)::int AS confirmed_without_pending,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM confirmed_at - pending_at)) AS median_pending_lead_sec,
+           percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch FROM confirmed_at - pending_at)) AS p95_pending_lead_sec,
+           max(extract(epoch FROM confirmed_at - pending_at)) AS max_pending_lead_sec
+      FROM pj`
+
+  const [summary, mismatches, deliveries, gaps, pendingRows] = await Promise.all([
     q(`SELECT count(*)::int AS pairs_seen,
               count(*) FILTER (WHERE alchemy_first IS NOT NULL AND blockdaemon_first IS NOT NULL)::int AS both,
               count(*) FILTER (WHERE blockdaemon_first IS NULL)::int AS alchemy_only,
@@ -475,6 +528,7 @@ app.get('/compare', async (c) => {
           WHERE next_ts - ts > interval '90 seconds' ORDER BY ts DESC LIMIT 50`,
       )
       .then((r) => r.rows),
+    pool.query(pendingSql, [grace, since]).then((r) => r.rows),
   ])
 
   return c.json({
@@ -483,6 +537,7 @@ app.get('/compare', async (c) => {
     note: 'positive *_sec = Alchemy received later than Blockdaemon; nets are in satoshis',
     summary: summary[0],
     mismatches,
+    blockdaemon_pending: pendingRows[0],
     deliveries,
     receiver_gaps: gaps,
   })
