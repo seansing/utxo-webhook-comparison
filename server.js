@@ -18,7 +18,7 @@ if (!DATABASE_URL) {
 
 const pool = new pg.Pool({ connectionString: DATABASE_URL })
 
-// Safe to run on every start: creates tables, adds any new columns to the old `events` table.
+// Safe to run on every start: creates tables, adds any new columns to existing tables.
 await pool.query(`
   CREATE TABLE IF NOT EXISTS events (
     id          BIGSERIAL PRIMARY KEY,
@@ -40,7 +40,8 @@ await pool.query(`
   CREATE INDEX IF NOT EXISTS events_provider_time ON events (provider, received_at);
   CREATE INDEX IF NOT EXISTS events_provider_hash ON events (provider, body_sha256);
 
-  -- One row per (transaction, tracked address) for Alchemy, one row per transaction for Blockdaemon.
+  -- Alchemy: one row per (transaction, tracked address).
+  -- Blockdaemon: one row per transaction INPUT or OUTPUT that touches a tracked address.
   CREATE TABLE IF NOT EXISTS tx_events (
     id           BIGSERIAL PRIMARY KEY,
     event_id     BIGINT NOT NULL REFERENCES events(id),
@@ -56,6 +57,10 @@ await pool.query(`
     net_value    NUMERIC,
     block_time   TIMESTAMPTZ
   );
+  ALTER TABLE tx_events
+    ADD COLUMN IF NOT EXISTS leg        TEXT,     -- Blockdaemon only: 'input' | 'output'
+    ADD COLUMN IF NOT EXISTS value_sats NUMERIC,  -- Blockdaemon only: amount of that input/output
+    ADD COLUMN IF NOT EXISTS n          INTEGER;  -- output index (or, for inputs, the spent output's index)
   CREATE INDEX IF NOT EXISTS tx_events_tx ON tx_events (tx_id);
   CREATE INDEX IF NOT EXISTS tx_events_provider_tx ON tx_events (provider, tx_id);
 
@@ -102,6 +107,12 @@ const toDate = (v) => {
   return Number.isNaN(d.getTime()) ? null : d
 }
 
+// Blockdaemon sends BTC as decimals (0.0923855); Alchemy sends satoshis as strings.
+const btcToSats = (v) => {
+  const n = Number(v)
+  return v != null && Number.isFinite(n) ? String(Math.round(n * 1e8)) : null
+}
+
 const sourceIp = (c) =>
   (c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || '').split(',')[0].trim() || null
 
@@ -128,31 +139,122 @@ function extractAlchemy(body) {
       direction: a.direction ?? null,
       net_value: /^-?\d+$/.test(String(a.netValue)) ? String(a.netValue) : null,
       block_time: toDate(a.blockTimestamp),
+      leg: null,
+      value_sats: null,
+      n: null,
     }))
 }
 
+// Blockdaemon (UNIFIED_V1, Bitcoin) sends one event per input and per output that touches a
+// tracked address: unified_confirmed_input / unified_confirmed_output. The transaction they belong
+// to is `data.enclosing_tx_id`. (An older `unified_confirmed_tx` shape is also handled.)
 function extractBlockdaemon(body) {
-  if (body?.event_type !== 'unified_confirmed_tx' || !body.data?.tx_id) return []
-  const d = body.data
-  // Blockdaemon doesn't say which address matched, so keep every address in the transfers.
-  const addrs = new Set()
-  for (const t of d.transfers ?? []) {
-    for (const k of ['from', 'to']) if (typeof t?.[k] === 'string') addrs.add(t[k])
+  const d = body?.data
+  if (!d) return []
+  const base = {
+    block_height: toNum(d.block_number),
+    block_hash: d.block_hash ?? null,
+    status: 'confirmed',
+    block_time: toDate(d.block_timestamp),
+    direction: null,
+    net_value: null,
   }
-  return [
-    {
-      tx_id: d.tx_id,
-      block_height: toNum(d.block_number),
-      block_hash: d.block_hash ?? null,
-      status: d.status ?? null,
-      address: null,
-      addresses: [...addrs],
-      direction: null,
-      net_value: null,
-      block_time: toDate(d.timestamp),
-    },
-  ]
+
+  if (body.event_type === 'unified_confirmed_output' && d.enclosing_tx_id) {
+    const a = d.scriptPubKey?.address ?? null
+    return [
+      {
+        ...base,
+        tx_id: d.enclosing_tx_id,
+        address: a,
+        addresses: a ? [a] : [],
+        leg: 'output',
+        value_sats: btcToSats(d.value),
+        n: toNum(d.n),
+      },
+    ]
+  }
+
+  if (body.event_type === 'unified_confirmed_input' && d.enclosing_tx_id) {
+    const a = d.prevout?.scriptPubKey?.address ?? null
+    return [
+      {
+        ...base,
+        tx_id: d.enclosing_tx_id,
+        address: a,
+        addresses: a ? [a] : [],
+        leg: 'input',
+        value_sats: btcToSats(d.prevout?.value),
+        n: toNum(d.vout),
+      },
+    ]
+  }
+
+  if (body.event_type === 'unified_confirmed_tx' && d.tx_id) {
+    const addrs = new Set()
+    for (const t of d.transfers ?? []) {
+      for (const k of ['from', 'to']) if (typeof t?.[k] === 'string') addrs.add(t[k])
+    }
+    return [
+      {
+        ...base,
+        tx_id: d.tx_id,
+        status: d.status ?? null,
+        block_time: toDate(d.timestamp),
+        address: null,
+        addresses: [...addrs],
+        leg: null,
+        value_sats: null,
+        n: null,
+      },
+    ]
+  }
+
+  return []
 }
+
+async function insertTx(eventId, provider, receivedAt, r) {
+  await pool.query(
+    `INSERT INTO tx_events
+       (event_id, provider, received_at, tx_id, block_height, block_hash, status,
+        address, addresses, direction, net_value, block_time, leg, value_sats, n)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+    [
+      eventId,
+      provider,
+      receivedAt,
+      r.tx_id,
+      r.block_height,
+      r.block_hash,
+      r.status,
+      r.address,
+      r.addresses,
+      r.direction,
+      r.net_value,
+      r.block_time,
+      r.leg,
+      r.value_sats,
+      r.n,
+    ],
+  )
+}
+
+// Earlier deliveries that arrived before we understood Blockdaemon's input/output events were
+// stored raw but never extracted. Extract them now (runs on every start, does nothing once done).
+async function backfillBlockdaemon() {
+  const { rows } = await pool.query(
+    `SELECT e.id, e.received_at, e.body FROM events e
+      WHERE e.provider = 'blockdaemon' AND e.body IS NOT NULL
+        AND e.event_type IN ('unified_confirmed_input', 'unified_confirmed_output')
+        AND NOT EXISTS (SELECT 1 FROM tx_events t WHERE t.event_id = e.id)
+      ORDER BY e.id`,
+  )
+  for (const r of rows) {
+    for (const x of extractBlockdaemon(r.body)) await insertTx(r.id, 'blockdaemon', r.received_at, x)
+  }
+  if (rows.length) console.log(`backfilled ${rows.length} blockdaemon events into tx_events`)
+}
+await backfillBlockdaemon()
 
 // Store one delivery. Throws if the DB write of the raw event fails.
 async function record(c, { provider, receivedAt, raw, body, verified, eventType, eventId, extract }) {
@@ -197,26 +299,7 @@ async function record(c, { provider, receivedAt, raw, body, verified, eventType,
 
   for (const r of rows) {
     try {
-      await pool.query(
-        `INSERT INTO tx_events
-           (event_id, provider, received_at, tx_id, block_height, block_hash, status,
-            address, addresses, direction, net_value, block_time)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-        [
-          ev.id,
-          provider,
-          receivedAt,
-          r.tx_id,
-          r.block_height,
-          r.block_hash,
-          r.status,
-          r.address,
-          r.addresses,
-          r.direction,
-          r.net_value,
-          r.block_time,
-        ],
-      )
+      await insertTx(ev.id, provider, receivedAt, r)
     } catch (e) {
       await pool.query("UPDATE events SET note = concat_ws('; ', note, $2::text) WHERE id = $1", [
         ev.id,
@@ -285,7 +368,7 @@ app.post('/blockdaemon', (c) =>
     provider: 'blockdaemon',
     extract: extractBlockdaemon,
     typeOf: (b) => b.event_type ?? null,
-    idOf: () => null,
+    idOf: (b) => b.id ?? null, // Blockdaemon's per-event uuid
     check: (c, raw) => {
       if (!BLOCKDAEMON_SECRET) return null
       const expected =
@@ -322,35 +405,59 @@ app.get('/stats', async (c) => {
   return c.json(rows)
 })
 
-// Live comparison. ?grace=10 ignores transactions first seen in the last N minutes (still in flight).
+// Live comparison, matched on (transaction, tracked address).
+//   ?grace=10   ignore pairs first seen in the last N minutes (still in flight)
+//   ?since=ISO  ignore pairs first seen before this time (use the later of the two go-live times)
+// Alchemy gives netValue directly; for Blockdaemon we compute it as (sum of outputs to the address)
+// minus (sum of inputs from the address), so the two can be checked against each other.
 app.get('/compare', async (c) => {
   if (!guard(c)) return c.text('forbidden', 403)
   const g = Number(c.req.query('grace') ?? 10)
   const grace = Number.isFinite(g) ? Math.floor(g) : 10
+  const s = c.req.query('since') ? new Date(c.req.query('since')) : null
+  const since = s && !Number.isNaN(s.getTime()) ? s : null
 
   const joined = `
     WITH a AS (
-      SELECT tx_id, min(received_at) AS t FROM tx_events
-       WHERE provider = 'alchemy' AND coalesce(status, '') <> 'removed' GROUP BY 1),
+      SELECT tx_id, address, min(received_at) AS t, (array_agg(net_value ORDER BY id))[1] AS net
+        FROM tx_events
+       WHERE provider = 'alchemy' AND coalesce(status, '') <> 'removed' AND address IS NOT NULL
+       GROUP BY 1, 2),
+    bd AS (
+      SELECT DISTINCT ON (tx_id, address, leg, n) tx_id, address, leg, n, value_sats, received_at
+        FROM tx_events
+       WHERE provider = 'blockdaemon' AND address IS NOT NULL
+       ORDER BY tx_id, address, leg, n, received_at),
     b AS (
-      SELECT tx_id, min(received_at) AS t FROM tx_events
-       WHERE provider = 'blockdaemon' GROUP BY 1),
+      SELECT tx_id, address, min(received_at) AS t,
+             sum(CASE leg WHEN 'output' THEN value_sats WHEN 'input' THEN -value_sats ELSE 0 END) AS net
+        FROM bd GROUP BY 1, 2),
     j AS (
-      SELECT coalesce(a.tx_id, b.tx_id) AS tx_id, a.t AS alchemy_first, b.t AS blockdaemon_first
-        FROM a FULL JOIN b ON a.tx_id = b.tx_id
-       WHERE least(a.t, b.t) < now() - make_interval(mins => $1::int))`
-  const q = (sql) => pool.query(joined + sql, [grace]).then((r) => r.rows)
+      SELECT coalesce(a.tx_id, b.tx_id) AS tx_id, coalesce(a.address, b.address) AS address,
+             a.t AS alchemy_first, b.t AS blockdaemon_first,
+             a.net AS alchemy_net, b.net AS blockdaemon_net
+        FROM a FULL JOIN b ON a.tx_id = b.tx_id AND a.address = b.address
+       WHERE least(a.t, b.t) < now() - make_interval(mins => $1::int)
+         AND ($2::timestamptz IS NULL OR least(a.t, b.t) >= $2))`
+  const q = (sql) => pool.query(joined + sql, [grace, since]).then((r) => r.rows)
 
   const [summary, mismatches, deliveries, gaps] = await Promise.all([
-    q(`SELECT count(*)::int AS txs_seen,
+    q(`SELECT count(*)::int AS pairs_seen,
               count(*) FILTER (WHERE alchemy_first IS NOT NULL AND blockdaemon_first IS NOT NULL)::int AS both,
               count(*) FILTER (WHERE blockdaemon_first IS NULL)::int AS alchemy_only,
               count(*) FILTER (WHERE alchemy_first IS NULL)::int AS blockdaemon_only,
+              count(*) FILTER (WHERE alchemy_first IS NOT NULL AND blockdaemon_first IS NOT NULL
+                                 AND alchemy_net IS DISTINCT FROM blockdaemon_net)::int AS net_differs,
               percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM alchemy_first - blockdaemon_first)) AS median_alchemy_minus_blockdaemon_sec,
               percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch FROM alchemy_first - blockdaemon_first)) AS p95_alchemy_minus_blockdaemon_sec
          FROM j`),
-    q(`SELECT tx_id, alchemy_first, blockdaemon_first FROM j
-        WHERE alchemy_first IS NULL OR blockdaemon_first IS NULL
+    q(`SELECT tx_id, address, alchemy_first, blockdaemon_first, alchemy_net, blockdaemon_net,
+              CASE WHEN blockdaemon_first IS NULL THEN 'alchemy_only'
+                   WHEN alchemy_first IS NULL THEN 'blockdaemon_only'
+                   ELSE 'net_differs' END AS kind
+         FROM j
+        WHERE blockdaemon_first IS NULL OR alchemy_first IS NULL
+           OR alchemy_net IS DISTINCT FROM blockdaemon_net
         ORDER BY coalesce(alchemy_first, blockdaemon_first) DESC LIMIT 50`),
     pool
       .query(
@@ -372,7 +479,8 @@ app.get('/compare', async (c) => {
 
   return c.json({
     grace_minutes: grace,
-    note: 'positive *_sec = Alchemy received later than Blockdaemon',
+    since: since?.toISOString() ?? null,
+    note: 'positive *_sec = Alchemy received later than Blockdaemon; nets are in satoshis',
     summary: summary[0],
     mismatches,
     deliveries,
