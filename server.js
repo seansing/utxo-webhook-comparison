@@ -60,7 +60,8 @@ await pool.query(`
   ALTER TABLE tx_events
     ADD COLUMN IF NOT EXISTS leg        TEXT,     -- Blockdaemon only: 'input' | 'output'
     ADD COLUMN IF NOT EXISTS value_sats NUMERIC,  -- Blockdaemon only: amount of that input/output
-    ADD COLUMN IF NOT EXISTS n          INTEGER;  -- output index (or, for inputs, the spent output's index)
+    ADD COLUMN IF NOT EXISTS n          INTEGER,  -- output index (or, for inputs, the spent output's index)
+    ADD COLUMN IF NOT EXISTS coinbase   BOOLEAN;  -- Alchemy only: is this a miner reward (coinbase) transaction
   CREATE INDEX IF NOT EXISTS tx_events_tx ON tx_events (tx_id);
   CREATE INDEX IF NOT EXISTS tx_events_provider_tx ON tx_events (provider, tx_id);
 
@@ -115,13 +116,14 @@ const btcToSats = (v) => {
 
 // The addresses we track (same five on both providers). Blockdaemon's whole-transaction events
 // list every address in the tx, so we need this list to keep only ours.
-const TRACKED = new Set([
-  'bc1quhruqrghgcca950rvhtrg7cpd7u8k6svpzgzmrjy8xyukacl5lkq0r8l2d', // OKX
-  'bc1qtm7ye0wm085hhv88japwkalmwkt3amec5z9c7a3unv05tfg6y2pstr3xfz', // Foundry
-  '37jKPSmbEGwgfacCr2nayn1wTaqMAbA94Z', // AntPool
-  '1K6KoYC69NnafWJ7YgtrpwJxBLiijWqwa6', // F2Pool
-  '1Ay8vMC7R1UbyCCZRVULMV7iQpHSAbguJP', // Upbit
-])
+const TRACKED_NAMES = {
+  bc1quhruqrghgcca950rvhtrg7cpd7u8k6svpzgzmrjy8xyukacl5lkq0r8l2d: 'OKX',
+  bc1qtm7ye0wm085hhv88japwkalmwkt3amec5z9c7a3unv05tfg6y2pstr3xfz: 'Foundry',
+  '37jKPSmbEGwgfacCr2nayn1wTaqMAbA94Z': 'AntPool',
+  '1K6KoYC69NnafWJ7YgtrpwJxBLiijWqwa6': 'F2Pool',
+  '1Ay8vMC7R1UbyCCZRVULMV7iQpHSAbguJP': 'Upbit',
+}
+const TRACKED = new Set(Object.keys(TRACKED_NAMES))
 
 const sourceIp = (c) =>
   (c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || '').split(',')[0].trim() || null
@@ -152,6 +154,7 @@ function extractAlchemy(body) {
       leg: null,
       value_sats: null,
       n: null,
+      coinbase: typeof a.coinbase === 'boolean' ? a.coinbase : null,
     }))
 }
 
@@ -240,8 +243,8 @@ async function insertTx(eventId, provider, receivedAt, r) {
   await pool.query(
     `INSERT INTO tx_events
        (event_id, provider, received_at, tx_id, block_height, block_hash, status,
-        address, addresses, direction, net_value, block_time, leg, value_sats, n)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+        address, addresses, direction, net_value, block_time, leg, value_sats, n, coinbase)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
     [
       eventId,
       provider,
@@ -258,6 +261,7 @@ async function insertTx(eventId, provider, receivedAt, r) {
       r.leg,
       r.value_sats,
       r.n,
+      r.coinbase ?? null,
     ],
   )
 }
@@ -283,6 +287,16 @@ async function backfillBlockdaemon() {
   if (rows.length) console.log(`backfilled ${rows.length} blockdaemon events into tx_events`)
 }
 await backfillBlockdaemon()
+
+// Alchemy rows saved before we recorded the `coinbase` flag: fill it in from the stored payloads.
+await pool.query(`
+  UPDATE tx_events t
+     SET coinbase = (a ->> 'coinbase')::boolean
+    FROM events e, jsonb_array_elements(e.body -> 'event' -> 'activity') a
+   WHERE t.provider = 'alchemy' AND t.coinbase IS NULL
+     AND e.id = t.event_id AND jsonb_typeof(e.body -> 'event' -> 'activity') = 'array'
+     AND a ->> 'txid' = t.tx_id AND a ->> 'address' = t.address
+     AND a ->> 'coinbase' IN ('true', 'false')`)
 
 // Store one delivery. Throws if the DB write of the raw event fails.
 async function record(c, { provider, receivedAt, raw, body, verified, eventType, eventId, extract }) {
@@ -433,44 +447,69 @@ app.get('/stats', async (c) => {
   return c.json(rows)
 })
 
-// Live comparison, matched on (transaction, tracked address).
+// ---- Comparison ------------------------------------------------------------
+// Everything is matched on (transaction, tracked address).
 //   ?grace=10   ignore pairs first seen in the last N minutes (still in flight)
-//   ?since=ISO  ignore pairs first seen before this time (use the later of the two go-live times)
+//   ?since=ISO  ignore pairs first seen before this time
 // Alchemy gives netValue directly; for Blockdaemon we compute it as (sum of outputs to the address)
 // minus (sum of inputs from the address), so the two can be checked against each other.
-app.get('/compare', async (c) => {
-  if (!guard(c)) return c.text('forbidden', 403)
+// delay_sec = (when Alchemy's alert arrived) minus (when Blockdaemon's CONFIRMED alert arrived).
+//   positive = Alchemy later, negative = Alchemy first.
+// had_pending = Blockdaemon sent a pending (mempool) alert for it before its confirmed alert.
+const JOINED = `
+  WITH a AS (
+    SELECT tx_id, address, min(received_at) AS t, (array_agg(net_value ORDER BY id))[1] AS net,
+           (array_agg(event_id ORDER BY id))[1] AS ev, coalesce(bool_or(coinbase), false) AS cb
+      FROM tx_events
+     WHERE provider = 'alchemy' AND coalesce(status, '') <> 'removed' AND address IS NOT NULL
+     GROUP BY 1, 2),
+  ae AS (
+    SELECT event_id, count(*)::int AS n FROM tx_events WHERE provider = 'alchemy' GROUP BY 1),
+  bd AS (
+    SELECT DISTINCT ON (tx_id, address, leg, n) tx_id, address, leg, n, value_sats, received_at
+      FROM tx_events
+     WHERE provider = 'blockdaemon' AND address IS NOT NULL AND coalesce(status, '') <> 'pending'
+     ORDER BY tx_id, address, leg, n, received_at),
+  b AS (
+    SELECT tx_id, address, min(received_at) AS t,
+           sum(CASE leg WHEN 'output' THEN value_sats WHEN 'input' THEN -value_sats ELSE 0 END) AS net
+      FROM bd GROUP BY 1, 2),
+  p AS (
+    SELECT tx_id, address, min(received_at) AS t FROM tx_events
+     WHERE provider = 'blockdaemon' AND status = 'pending' AND address IS NOT NULL GROUP BY 1, 2),
+  j AS (
+    SELECT coalesce(a.tx_id, b.tx_id) AS tx_id, coalesce(a.address, b.address) AS address,
+           a.t AS alchemy_first, b.t AS blockdaemon_first,
+           a.net AS alchemy_net, b.net AS blockdaemon_net,
+           p.t AS pending_first, ae.n AS alchemy_entries, a.cb AS coinbase,
+           extract(epoch FROM a.t - b.t) AS delay_sec,
+           (p.t IS NOT NULL AND b.t IS NOT NULL AND p.t < b.t) AS had_pending,
+           extract(epoch FROM b.t - p.t) AS pending_lead_sec
+      FROM a FULL JOIN b ON a.tx_id = b.tx_id AND a.address = b.address
+      LEFT JOIN p ON p.tx_id = coalesce(a.tx_id, b.tx_id) AND p.address = coalesce(a.address, b.address)
+      LEFT JOIN ae ON ae.event_id = a.ev
+     WHERE least(a.t, b.t) < now() - make_interval(mins => $1::int)
+       AND ($2::timestamptz IS NULL OR least(a.t, b.t) >= $2))`
+
+function windowParams(c) {
   const g = Number(c.req.query('grace') ?? 10)
   const grace = Number.isFinite(g) ? Math.floor(g) : 10
   const s = c.req.query('since') ? new Date(c.req.query('since')) : null
   const since = s && !Number.isNaN(s.getTime()) ? s : null
+  return { grace, since }
+}
 
-  const joined = `
-    WITH a AS (
-      SELECT tx_id, address, min(received_at) AS t, (array_agg(net_value ORDER BY id))[1] AS net
-        FROM tx_events
-       WHERE provider = 'alchemy' AND coalesce(status, '') <> 'removed' AND address IS NOT NULL
-       GROUP BY 1, 2),
-    bd AS (
-      SELECT DISTINCT ON (tx_id, address, leg, n) tx_id, address, leg, n, value_sats, received_at
-        FROM tx_events
-       WHERE provider = 'blockdaemon' AND address IS NOT NULL AND coalesce(status, '') <> 'pending'
-       ORDER BY tx_id, address, leg, n, received_at),
-    b AS (
-      SELECT tx_id, address, min(received_at) AS t,
-             sum(CASE leg WHEN 'output' THEN value_sats WHEN 'input' THEN -value_sats ELSE 0 END) AS net
-        FROM bd GROUP BY 1, 2),
-    j AS (
-      SELECT coalesce(a.tx_id, b.tx_id) AS tx_id, coalesce(a.address, b.address) AS address,
-             a.t AS alchemy_first, b.t AS blockdaemon_first,
-             a.net AS alchemy_net, b.net AS blockdaemon_net
-        FROM a FULL JOIN b ON a.tx_id = b.tx_id AND a.address = b.address
-       WHERE least(a.t, b.t) < now() - make_interval(mins => $1::int)
-         AND ($2::timestamptz IS NULL OR least(a.t, b.t) >= $2))`
-  const q = (sql) => pool.query(joined + sql, [grace, since]).then((r) => r.rows)
+// The tracked addresses as a SQL VALUES list (constants from this file, not user input).
+const TRACKED_VALUES = Object.entries(TRACKED_NAMES)
+  .map(([addr, name]) => `('${addr.replace(/'/g, "''")}', '${name.replace(/'/g, "''")}')`)
+  .join(', ')
 
-  // Blockdaemon pending (mempool) notifications. Alchemy has no equivalent, so this is a report on
-  // Blockdaemon alone: how often a pending alert came before the confirmed one, and by how long.
+app.get('/compare', async (c) => {
+  if (!guard(c)) return c.text('forbidden', 403)
+  const { grace, since } = windowParams(c)
+  const q = (sql) => pool.query(JOINED + sql, [grace, since]).then((r) => r.rows)
+
+  // Blockdaemon pending (mempool) notifications over ALL pending alerts (also ones not yet confirmed).
   const pendingSql = `
     WITH p AS (
       SELECT tx_id, address, min(received_at) AS t FROM tx_events
@@ -488,59 +527,128 @@ app.get('/compare', async (c) => {
            count(*) FILTER (WHERE pending_at IS NOT NULL AND confirmed_at IS NOT NULL)::int AS pending_then_confirmed,
            count(*) FILTER (WHERE pending_at IS NOT NULL AND confirmed_at IS NULL
                               AND pending_at < now() - interval '60 minutes')::int AS pending_not_confirmed_after_60min,
-           count(*) FILTER (WHERE pending_at IS NULL)::int AS confirmed_without_pending,
            percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM confirmed_at - pending_at)) AS median_pending_lead_sec,
            percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch FROM confirmed_at - pending_at)) AS p95_pending_lead_sec,
-           max(extract(epoch FROM confirmed_at - pending_at)) AS max_pending_lead_sec
+           max(extract(epoch FROM confirmed_at - pending_at))::float8 AS max_pending_lead_sec
       FROM pj`
 
-  const [summary, mismatches, deliveries, gaps, pendingRows] = await Promise.all([
-    q(`SELECT count(*)::int AS pairs_seen,
-              count(*) FILTER (WHERE alchemy_first IS NOT NULL AND blockdaemon_first IS NOT NULL)::int AS both,
-              count(*) FILTER (WHERE blockdaemon_first IS NULL)::int AS alchemy_only,
-              count(*) FILTER (WHERE alchemy_first IS NULL)::int AS blockdaemon_only,
-              count(*) FILTER (WHERE alchemy_first IS NOT NULL AND blockdaemon_first IS NOT NULL
-                                 AND alchemy_net IS DISTINCT FROM blockdaemon_net)::int AS net_differs,
-              percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM alchemy_first - blockdaemon_first)) AS median_alchemy_minus_blockdaemon_sec,
-              percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch FROM alchemy_first - blockdaemon_first)) AS p95_alchemy_minus_blockdaemon_sec
-         FROM j`),
-    q(`SELECT tx_id, address, alchemy_first, blockdaemon_first, alchemy_net, blockdaemon_net,
-              CASE WHEN blockdaemon_first IS NULL THEN 'alchemy_only'
-                   WHEN alchemy_first IS NULL THEN 'blockdaemon_only'
-                   ELSE 'net_differs' END AS kind
-         FROM j
-        WHERE blockdaemon_first IS NULL OR alchemy_first IS NULL
-           OR alchemy_net IS DISTINCT FROM blockdaemon_net
-        ORDER BY coalesce(alchemy_first, blockdaemon_first) DESC LIMIT 50`),
-    pool
-      .query(
-        `SELECT provider, count(*)::int AS deliveries,
-                count(*) FILTER (WHERE verified IS FALSE)::int AS bad_signature,
-                count(*) FILTER (WHERE dup_of IS NOT NULL)::int AS exact_duplicates,
-                count(*) FILTER (WHERE note IS NOT NULL)::int AS with_notes
-           FROM events GROUP BY 1 ORDER BY 1`,
-      )
-      .then((r) => r.rows),
-    pool
-      .query(
-        `SELECT ts AS down_from, next_ts AS back_at FROM (
-           SELECT ts, lead(ts) OVER (ORDER BY ts) AS next_ts FROM heartbeats) h
-          WHERE next_ts - ts > interval '90 seconds' ORDER BY ts DESC LIMIT 50`,
-      )
-      .then((r) => r.rows),
-    pool.query(pendingSql, [grace, since]).then((r) => r.rows),
-  ])
+  const [summary, mismatches, labels, byAddress, byBatch, byCoinbase, deliveries, gaps, pendingRows] =
+    await Promise.all([
+      q(`SELECT count(*)::int AS pairs_seen,
+                count(*) FILTER (WHERE alchemy_first IS NOT NULL AND blockdaemon_first IS NOT NULL)::int AS both,
+                count(*) FILTER (WHERE blockdaemon_first IS NULL)::int AS alchemy_only,
+                count(*) FILTER (WHERE alchemy_first IS NULL)::int AS blockdaemon_only,
+                count(*) FILTER (WHERE alchemy_first IS NOT NULL AND blockdaemon_first IS NOT NULL
+                                   AND alchemy_net IS DISTINCT FROM blockdaemon_net)::int AS net_differs,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY delay_sec) AS median_alchemy_minus_blockdaemon_sec,
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY delay_sec) AS p95_alchemy_minus_blockdaemon_sec,
+                min(delay_sec)::float8 AS min_alchemy_minus_blockdaemon_sec,
+                max(delay_sec)::float8 AS max_alchemy_minus_blockdaemon_sec,
+                count(*) FILTER (WHERE delay_sec < 0)::int AS alchemy_first_count,
+                round(100.0 * count(*) FILTER (WHERE delay_sec < 0) / nullif(count(delay_sec), 0), 1)::float8 AS alchemy_first_pct
+           FROM j`),
+      q(`SELECT tx_id, address, alchemy_first, blockdaemon_first, alchemy_net, blockdaemon_net,
+                CASE WHEN blockdaemon_first IS NULL THEN 'alchemy_only'
+                     WHEN alchemy_first IS NULL THEN 'blockdaemon_only'
+                     ELSE 'net_differs' END AS kind
+           FROM j
+          WHERE blockdaemon_first IS NULL OR alchemy_first IS NULL
+             OR alchemy_net IS DISTINCT FROM blockdaemon_net
+          ORDER BY coalesce(alchemy_first, blockdaemon_first) DESC LIMIT 50`),
+      // Of the transactions Blockdaemon confirmed: how many had a pending alert first, and why not?
+      q(`SELECT count(*) FILTER (WHERE blockdaemon_first IS NOT NULL)::int AS blockdaemon_confirmed,
+                count(*) FILTER (WHERE had_pending)::int AS had_pending,
+                count(*) FILTER (WHERE blockdaemon_first IS NOT NULL AND NOT had_pending)::int AS no_pending,
+                count(*) FILTER (WHERE blockdaemon_first IS NOT NULL AND NOT had_pending AND coinbase)::int AS no_pending_and_coinbase,
+                count(*) FILTER (WHERE blockdaemon_first IS NOT NULL AND NOT had_pending
+                                   AND NOT coalesce(coinbase, false))::int AS no_pending_and_not_coinbase,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY pending_lead_sec) FILTER (WHERE had_pending) AS median_pending_lead_sec
+           FROM j`),
+      pool
+        .query(
+          JOINED +
+            `, tr(address, name) AS (VALUES ${TRACKED_VALUES})
+             SELECT tr.name, tr.address, count(x.tx_id)::int AS pairs,
+                    count(*) FILTER (WHERE x.alchemy_first IS NOT NULL AND x.blockdaemon_first IS NOT NULL)::int AS both,
+                    count(*) FILTER (WHERE x.tx_id IS NOT NULL AND x.blockdaemon_first IS NULL)::int AS alchemy_only,
+                    count(*) FILTER (WHERE x.tx_id IS NOT NULL AND x.alchemy_first IS NULL)::int AS blockdaemon_only,
+                    count(*) FILTER (WHERE x.had_pending)::int AS had_pending,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY x.delay_sec) AS median_delay_sec,
+                    max(coalesce(x.alchemy_first, x.blockdaemon_first)) AS last_seen
+               FROM tr LEFT JOIN j x ON x.address = tr.address
+              GROUP BY tr.name, tr.address ORDER BY pairs DESC`,
+          [grace, since],
+        )
+        .then((r) => r.rows),
+      // Does a bigger Alchemy delivery (more tracked activity in the same block) arrive later?
+      q(`SELECT CASE WHEN alchemy_entries = 1 THEN '1' WHEN alchemy_entries <= 3 THEN '2-3'
+                     WHEN alchemy_entries <= 9 THEN '4-9' ELSE '10+' END AS alchemy_delivery_entries,
+                count(*)::int AS pairs, percentile_cont(0.5) WITHIN GROUP (ORDER BY delay_sec) AS median_delay_sec
+           FROM j WHERE delay_sec IS NOT NULL AND alchemy_entries IS NOT NULL
+          GROUP BY 1 ORDER BY min(alchemy_entries)`),
+      q(`SELECT coalesce(coinbase, false) AS coinbase, count(*)::int AS pairs,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY delay_sec) AS median_delay_sec
+           FROM j WHERE delay_sec IS NOT NULL GROUP BY 1 ORDER BY 1`),
+      pool
+        .query(
+          `SELECT provider, count(*)::int AS deliveries,
+                  count(*) FILTER (WHERE verified IS FALSE)::int AS bad_signature,
+                  count(*) FILTER (WHERE dup_of IS NOT NULL)::int AS exact_duplicates,
+                  count(*) FILTER (WHERE note IS NOT NULL)::int AS with_notes
+             FROM events GROUP BY 1 ORDER BY 1`,
+        )
+        .then((r) => r.rows),
+      pool
+        .query(
+          `SELECT ts AS down_from, next_ts AS back_at FROM (
+             SELECT ts, lead(ts) OVER (ORDER BY ts) AS next_ts FROM heartbeats) h
+            WHERE next_ts - ts > interval '90 seconds' ORDER BY ts DESC LIMIT 50`,
+        )
+        .then((r) => r.rows),
+      pool.query(pendingSql, [grace, since]).then((r) => r.rows),
+    ])
 
   return c.json({
     grace_minutes: grace,
     since: since?.toISOString() ?? null,
-    note: 'positive *_sec = Alchemy received later than Blockdaemon; nets are in satoshis',
+    note: 'delay = Alchemy arrival minus Blockdaemon CONFIRMED arrival (seconds): positive = Alchemy later, negative = Alchemy first. nets are in satoshis',
     summary: summary[0],
     mismatches,
+    pending_labels: labels[0],
     blockdaemon_pending: pendingRows[0],
+    by_address: byAddress,
+    delay_by_alchemy_delivery_size: byBatch,
+    delay_by_coinbase: byCoinbase,
     deliveries,
     receiver_gaps: gaps,
   })
+})
+
+// One row per (transaction, address) so you can sort and filter it yourself.
+//   ?limit=50 (max 1000)  ?only=mismatch | no_pending | alchemy_first   plus ?since= and ?grace=
+app.get('/pairs', async (c) => {
+  if (!guard(c)) return c.text('forbidden', 403)
+  const { grace, since } = windowParams(c)
+  const limit = Math.min(Math.max(Number(c.req.query('limit') ?? 50) || 50, 1), 1000)
+  const only = c.req.query('only')
+  const where =
+    only === 'mismatch'
+      ? 'WHERE blockdaemon_first IS NULL OR alchemy_first IS NULL OR alchemy_net IS DISTINCT FROM blockdaemon_net'
+      : only === 'no_pending'
+        ? 'WHERE blockdaemon_first IS NOT NULL AND NOT had_pending'
+        : only === 'alchemy_first'
+          ? 'WHERE delay_sec < 0'
+          : ''
+  const { rows } = await pool.query(
+    JOINED +
+      ` SELECT tx_id, address, had_pending, round(delay_sec::numeric, 2)::float8 AS delay_sec,
+               round(pending_lead_sec::numeric, 1)::float8 AS pending_lead_sec, coinbase, alchemy_entries,
+               alchemy_first, blockdaemon_first, pending_first, alchemy_net, blockdaemon_net
+          FROM j ${where}
+         ORDER BY coalesce(alchemy_first, blockdaemon_first) DESC LIMIT ${limit}`,
+    [grace, since],
+  )
+  return c.json(rows)
 })
 
 serve({ fetch: app.fetch, port: Number(PORT), hostname: '0.0.0.0' }, (i) =>
